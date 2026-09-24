@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Station A — Émetteur</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+  <header>
+    <h1><span class="pastille">A</span> Station émettrice</h1>
+    <a class="lien" href="recepteur.html">Récepteur</a>
+    <a class="lien" href="dashboard.html">Dashboard</a>
+  </header>
+
+  <section class="card">
+    <h2>Connexions</h2>
+    <div class="row">
+      <button id="conn">Connecter l'Arduino</button>
+      <span id="etatCarte" class="muted">Carte non connectée</span>
+    </div>
+    <p id="etatCanal" class="muted">Canal de contrôle : en attente…</p>
+    <p class="muted petit">
+      Cette page pilote la LED. Le texte part par la lumière ; seule la
+      coordination passe par le réseau. Rien n'est écrit dans la base depuis ici :
+      c'est le récepteur qui enregistre ce qu'il a réellement reçu.
+    </p>
+  </section>
+
+  <section class="card">
+    <h2>Envoyer un message</h2>
+    <form id="txForm">
+      <input id="txt" maxlength="150" placeholder="Ton message" autocomplete="off">
+      <button id="sendBtn">Envoyer</button>
+    </form>
+    <div class="row">
+      <label>Durée d'un bit <input id="bitMs" type="number" min="10" max="1000" value="300"> ms</label>
+      <button id="applyBit" type="button">Appliquer</button>
+    </div>
+    <p id="report" class="muted"></p>
+    <div id="txBits" class="bits" title="Affiché MSB→LSB, émis LSB d'abord"></div>
+  </section>
+
+  <section class="card">
+    <h2>Retour du récepteur</h2>
+    <p id="retour" class="muted">Aucun résultat pour l'instant.</p>
+  </section>
+
+  <section class="card">
+    <h2>Journal</h2>
+    <ul id="journal" class="journal"></ul>
+  </section>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="config.js" onerror="window.SUPABASE_CONFIG=null"></script>
+<script src="commun.js"></script>
+<script>
+let sentBytes = [], txPos = 0, busy = false;
+
+function noter(t, classe) {
+  const li = document.createElement('li');
+  li.className = classe || '';
+  li.textContent = new Date().toLocaleTimeString('fr-FR') + ' · ' + t;
+  $('journal').prepend(li);
+  while ($('journal').children.length > 30) $('journal').lastChild.remove();
+}
+
+if (!('serial' in navigator)) {
+  $('etatCarte').textContent = 'Web Serial indisponible : ouvre la page dans Chrome ou Edge';
+  $('conn').disabled = true;
+}
+
+// ------------------------------------------------------------------ Arduino
+$('conn').onclick = async () => {
+  const ok = await connecterCarte(surLigneSerie, (t, vert) => {
+    $('etatCarte').textContent = t;
+    $('etatCarte').classList.toggle('vert', !!vert);
+  });
+  if (ok) { $('conn').disabled = true; noter('Arduino connectée'); }
+};
+
+function surLigneSerie(l) {
+  const idx = l.indexOf(':');
+  const k = idx < 0 ? l : l.slice(0, idx);
+  const v = idx < 0 ? '' : l.slice(idx + 1);
+  switch (k) {
+    case 'READY': versCarte('B:' + $('bitMs').value); noter('Carte prête'); break;
+    case 'S': txPos++; rendreTx(); break;
+    case 'D': finEmission(); break;
+    case 'E': noter('Carte : ' + v, 'ko'); break;
+  }
+}
+
+function rendreTx() {
+  $('txBits').innerHTML = sentBytes.map((b, i) =>
+    `<span class="${i === txPos - 1 ? 'cur' : i < txPos ? 'done' : ''}">${bits8(b)}</span>`).join('');
+}
+
+// ---------------------------------------------------- Canal de contrôle
+(async () => {
+  await ouvrirCanal((t, ok) => {
+    $('etatCanal').textContent = 'Canal de contrôle : ' + t;
+    $('etatCanal').classList.toggle('vert', !!ok);
+  });
+
+  surCanal(async p => {
+    // Le récepteur demande à piloter la LED pour se calibrer.
+    if (p.type === 'led') {
+      // On répond dans TOUS les cas : sans réponse, le récepteur attend 6 s pour
+      // rien et affiche un simple délai dépassé, sans dire ce qui a échoué.
+      if (busy) { await versCanal({ type: 'led_ko', raison: 'émission en cours' }); return; }
+      if (!carte.writer) {
+        noter('Le récepteur demande la LED, mais l\'Arduino n\'est pas connectée', 'ko');
+        await versCanal({ type: 'led_ko', raison: 'Arduino de A non connectée' });
+        return;
+      }
+      try {
+        await demanderCarte('O:' + (p.on ? 1 : 0), 'O:' + (p.on ? 1 : 0), 3000);
+        noter('Calibration distante : LED ' + (p.on ? 'allumée' : 'éteinte'));
+        await versCanal({ type: 'led_ok', on: p.on });
+      } catch (e) {
+        noter('La carte de A ne répond pas à O: — sketch à jour ? (' + e.message + ')', 'ko');
+        await versCanal({ type: 'led_ko',
+          raison: 'la carte de A ne reconnaît pas la commande O: (sketch pas à jour ?)' });
+      }
+    }
+    // Le récepteur annonce son résultat.
+    if (p.type === 'resultat') {
+      $('retour').textContent = p.ok
+        ? `Reçu à l'identique : « ${p.recu} » · 0 bit faux`
+        : `Reçu « ${p.recu} » · ${p.bitsFaux} bit(s) faux`;
+      $('retour').classList.toggle('vert', !!p.ok);
+      $('retour').classList.toggle('rouge', !p.ok);
+      noter('Retour du récepteur : ' + (p.ok ? 'transmission parfaite' : p.bitsFaux + ' bits faux')
+            + (p.ligne != null ? ' · ligne #' + p.ligne + ' enregistrée par B' : ''),
+            p.ok ? 'ok' : 'ko');
+    }
+    if (p.type === 'calibre') {
+      noter('Récepteur calibré · contraste ' + p.contraste, p.contraste > 150 ? 'ok' : 'ko');
+    }
+  });
+})();
+
+// ------------------------------------------------------------------ Émission
+$('txForm').onsubmit = async e => {
+  e.preventDefault();
+  const t = $('txt').value.replace(/[\r\n]/g, ' ');
+  if (!t || busy) return;
+  if (!carte.writer) { noter('Connecte d\'abord l\'Arduino', 'ko'); return; }
+
+  sentBytes = [...new TextEncoder().encode(t)];
+  if (sentBytes.length > 150) { noter('Message trop long (150 octets max)', 'ko'); return; }
+  txPos = 0; busy = true; $('sendBtn').disabled = true;
+  rendreTx();
+  $('retour').textContent = 'En attente du récepteur…';
+  $('retour').className = 'muted';
+
+  const bitMs = +$('bitMs').value;
+  const duree = (sentBytes.length * 11 * bitMs / 1000).toFixed(1);
+  $('report').textContent = `Transmission en cours (~${duree} s)…`;
+
+  // 1) On prévient le récepteur AVANT d'émettre : il a besoin du texte et des
+  //    bits émis pour comparer, et c'est LUI qui enregistrera la transmission.
+  //    Cette page n'écrit jamais dans Supabase.
+  await versCanal({ type: 'debut', texte: t, bitMs,
+                    bits: suiteBits(sentBytes), octets: sentBytes });
+
+  // 2) On émet par la lumière.
+  await versCarte('T:' + t);
+};
+
+function finEmission() {
+  busy = false;
+  $('sendBtn').disabled = false;
+  $('report').textContent = 'Émission terminée. Le récepteur décode.';
+  versCanal({ type: 'fin' });
+  noter('Émission terminée');
+}
+
+$('applyBit').onclick = async () => {
+  await versCarte('B:' + $('bitMs').value);
+  // Le récepteur échantillonne au milieu de chaque bit : il lui faut la même valeur.
+  await versCanal({ type: 'bitms', bitMs: +$('bitMs').value });
+  noter('Durée d\'un bit : ' + $('bitMs').value + ' ms (envoyée aussi au récepteur)');
+};
+</script>
+</body>
+</html>

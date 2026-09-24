@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lien optique — Dashboard</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+  <header>
+    <h1>Dashboard</h1>
+    <a class="lien" href="emetteur.html">Émetteur</a>
+    <a class="lien" href="recepteur.html">Récepteur</a>
+  </header>
+
+  <section class="card">
+    <div class="row entre">
+      <h2>Taux de réussite</h2>
+      <button id="refresh" type="button">Actualiser</button>
+    </div>
+    <p id="heroTaux" class="hero">—</p>
+    <p id="heroDetail" class="muted">Chargement…</p>
+    <div class="kpis">
+      <div class="kpi"><span id="kpiTotal">—</span><small>transmissions</small></div>
+      <div class="kpi"><span id="kpiOk" class="vert">—</span><small>réussies</small></div>
+      <div class="kpi"><span id="kpiKo" class="rouge">—</span><small>en erreur</small></div>
+      <div class="kpi"><span id="kpiContraste">—</span><small>contraste moyen</small></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Réussite selon la durée d'un bit</h2>
+    <div id="barres" class="barres"></div>
+    <p id="chartNote" class="muted"></p>
+  </section>
+
+  <section class="card">
+    <h2>Détail par durée de bit</h2>
+    <div class="tabwrap">
+      <table id="tableau" class="tbl">
+        <thead><tr>
+          <th>Durée d'un bit</th><th>Essais</th><th>Réussies</th>
+          <th>Taux</th><th>Bits faux (moyenne)</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Dernières transmissions</h2>
+    <ul id="history" class="history"></ul>
+  </section>
+</main>
+<div id="tip" class="tip" hidden></div>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="config.js" onerror="window.SUPABASE_CONFIG=null"></script>
+<script src="commun.js"></script>
+<script>
+const pct = (a, b) => b ? Math.round(a / b * 100) : 0;
+
+async function charger() {
+  if (!sb) { $('heroDetail').textContent = 'Supabase non configuré (config.js).'; return; }
+  await sonderMesures();
+
+  const champs = [COL.date, COL.envoye, COL.retrans, COL.statut];
+  if (mesuresDispo) champs.push(COL.bitMs, COL.bitsFaux, COL.contraste);
+  const { data, error } = await sb.from(COL.table)
+    .select(champs.join(','))
+    .order(COL.date, { ascending: false })
+    .limit(1000);
+  if (error) { $('heroDetail').textContent = 'Erreur Supabase : ' + error.message; return; }
+
+  rendre(data.filter(r => r[COL.statut] !== STATUT.encours));
+  rendreHistorique(data.slice(0, 10));
+}
+$('refresh').onclick = charger;
+
+function rendre(rows) {
+  const total = rows.length;
+  const ok = rows.filter(r => r[COL.statut] === STATUT.ok).length;
+
+  $('heroTaux').textContent = total ? pct(ok, total) + ' %' : '—';
+  $('heroDetail').textContent = total
+    ? `${ok} transmission${ok > 1 ? 's' : ''} sans erreur sur ${total}`
+    : 'Aucune transmission terminée pour l\'instant.';
+  $('kpiTotal').textContent = total || '—';
+  $('kpiOk').textContent = total ? ok : '—';
+  $('kpiKo').textContent = total ? total - ok : '—';
+
+  const contrastes = mesuresDispo
+    ? rows.map(r => r[COL.contraste]).filter(v => v != null) : [];
+  $('kpiContraste').textContent = contrastes.length
+    ? Math.round(contrastes.reduce((a, b) => a + b, 0) / contrastes.length) : '—';
+
+  if (!mesuresDispo) {
+    $('barres').innerHTML = '';
+    $('chartNote').textContent =
+      'Graphique indisponible : exécute supabase-v2.sql pour ajouter les colonnes de mesure.';
+    $('tableau').tBodies[0].innerHTML = '';
+    return;
+  }
+
+  const parBit = new Map();
+  rows.forEach(r => {
+    const b = r[COL.bitMs];
+    if (b == null) return;
+    if (!parBit.has(b)) parBit.set(b, { essais: 0, ok: 0, faux: [] });
+    const g = parBit.get(b);
+    g.essais++;
+    if (r[COL.statut] === STATUT.ok) g.ok++;
+    if (r[COL.bitsFaux] != null) g.faux.push(r[COL.bitsFaux]);
+  });
+
+  const lignes = [...parBit.entries()]
+    .map(([bit, g]) => ({
+      bit, essais: g.essais, ok: g.ok, taux: pct(g.ok, g.essais),
+      faux: g.faux.length ? (g.faux.reduce((a, b) => a + b, 0) / g.faux.length) : null,
+    }))
+    .sort((a, b) => b.bit - a.bit);
+
+  $('barres').innerHTML = lignes.map(l => `
+    <div class="barre" tabindex="0"
+         data-tip="${l.bit} ms · ${l.ok}/${l.essais} réussies${
+           l.faux != null ? ` · ${l.faux.toFixed(1)} bit(s) faux en moyenne` : ''}">
+      <span class="bLabel">${l.bit} ms</span>
+      <span class="bTrack"><span class="bFill" style="width:${l.taux}%"></span></span>
+      <span class="bVal">${l.taux} %</span>
+    </div>`).join('');
+  $('chartNote').textContent = lignes.length
+    ? 'Part des transmissions reçues sans aucun bit faux, pour chaque réglage de vitesse.'
+    : 'Aucune transmission avec une durée de bit enregistrée.';
+
+  $('tableau').tBodies[0].innerHTML = lignes.map(l => `
+    <tr>
+      <td>${l.bit} ms</td><td>${l.essais}</td><td>${l.ok}</td>
+      <td class="${l.taux === 100 ? 'vert' : l.taux >= 50 ? '' : 'rouge'}">${l.taux} %</td>
+      <td>${l.faux != null ? l.faux.toFixed(1) : '—'}</td>
+    </tr>`).join('');
+}
+
+function rendreHistorique(rows) {
+  $('history').innerHTML = rows.length
+    ? rows.map(m => {
+        const ok = m[COL.statut] === STATUT.ok;
+        const encours = m[COL.statut] === STATUT.encours;
+        return `<li>
+          <span class="${ok ? 'ok' : encours ? '' : 'bad'}">${ok ? '✓' : encours ? '…' : '✗'}</span>
+          ${esc(m[COL.envoye])} → ${esc(m[COL.retrans])}
+          <small>${esc(m[COL.statut])}${mesuresDispo && m[COL.bitMs] != null
+            ? ` · ${m[COL.bitMs]} ms · ${m[COL.bitsFaux]} bit(s) faux · contraste ${m[COL.contraste]}`
+            : ''} · ${new Date(m[COL.date]).toLocaleString('fr-FR')}</small>
+        </li>`;
+      }).join('')
+    : '<li class="muted">Aucune transmission enregistrée</li>';
+}
+
+const tip = $('tip');
+function montrerTip(el, x, y) {
+  tip.textContent = el.dataset.tip;
+  tip.hidden = false;
+  tip.style.left = Math.min(x + 12, window.innerWidth - tip.offsetWidth - 12) + 'px';
+  tip.style.top = (y + 14) + 'px';
+}
+document.addEventListener('mousemove', e => {
+  const el = e.target.closest?.('.barre');
+  if (el) montrerTip(el, e.clientX, e.clientY); else tip.hidden = true;
+});
+document.addEventListener('focusin', e => {
+  const el = e.target.closest?.('.barre');
+  if (!el) { tip.hidden = true; return; }
+  const r = el.getBoundingClientRect();
+  montrerTip(el, r.left, r.bottom);
+});
+
+charger();
+</script>
+</body>
+</html>

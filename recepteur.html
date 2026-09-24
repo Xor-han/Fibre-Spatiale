@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Station B — Récepteur</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+  <header>
+    <h1><span class="pastille">B</span> Station réceptrice</h1>
+    <a class="lien" href="emetteur.html">Émetteur</a>
+    <a class="lien" href="dashboard.html">Dashboard</a>
+  </header>
+
+  <section class="card">
+    <h2>Connexions</h2>
+    <div class="row">
+      <button id="conn">Connecter l'Arduino</button>
+      <span id="etatCarte" class="muted">Carte non connectée</span>
+    </div>
+    <p id="etatCanal" class="muted">Canal de contrôle : en attente…</p>
+    <p class="muted petit">
+      Cette page ne lit que la photorésistance, et c'est la seule des deux à écrire
+      dans la base : elle seule sait ce qui est réellement arrivé.
+    </p>
+  </section>
+
+  <section class="card">
+    <div class="row entre">
+      <h2>Calibration croisée</h2>
+      <button id="cal" type="button">Calibrer</button>
+    </div>
+    <div class="gauge"><div id="bar"></div><div id="thr"></div></div>
+    <p id="calInfo" class="muted">Pas encore calibré.</p>
+    <p class="muted petit">
+      Le récepteur doit apprendre le contraste de la LED de <strong>A</strong>, pas
+      d'une LED locale. Cette page pilote donc la LED distante par le réseau
+      pendant qu'elle mesure.
+    </p>
+  </section>
+
+  <section class="card">
+    <h2>Message reçu</h2>
+    <div id="rxText" class="rx"></div>
+    <div id="rxBits" class="bits"></div>
+    <p id="report" class="muted">En attente d'une transmission.</p>
+    <button id="clear" type="button">Effacer</button>
+  </section>
+
+  <section class="card">
+    <h2>Journal</h2>
+    <ul id="journal" class="journal"></ul>
+  </section>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="config.js" onerror="window.SUPABASE_CONFIG=null"></script>
+<script src="commun.js"></script>
+<script>
+let cal = null, rxBytes = [], rxStr = '', dec = new TextDecoder();
+let frameErr = 0, attendu = null, enCours = false, calibrationEnCours = false;
+let ligneId = null;
+
+function noter(t, classe) {
+  const li = document.createElement('li');
+  li.className = classe || '';
+  li.textContent = new Date().toLocaleTimeString('fr-FR') + ' · ' + t;
+  $('journal').prepend(li);
+  while ($('journal').children.length > 30) $('journal').lastChild.remove();
+}
+
+if (!('serial' in navigator)) {
+  $('etatCarte').textContent = 'Web Serial indisponible : ouvre la page dans Chrome ou Edge';
+  $('conn').disabled = true;
+}
+
+// ------------------------------------------------------------------ Arduino
+$('conn').onclick = async () => {
+  const ok = await connecterCarte(surLigneSerie, (t, vert) => {
+    $('etatCarte').textContent = t;
+    $('etatCarte').classList.toggle('vert', !!vert);
+  });
+  if (ok) { $('conn').disabled = true; noter('Arduino connectée'); }
+};
+
+function surLigneSerie(l) {
+  const idx = l.indexOf(':');
+  const k = idx < 0 ? l : l.slice(0, idx);
+  const v = idx < 0 ? '' : l.slice(idx + 1);
+  switch (k) {
+    case 'READY':
+      noter('Carte prête. Elle a tenté une calibration locale sans LED : normal, ' +
+            'le bouton Calibrer va la corriger.');
+      break;
+    case 'CAL': {
+      const [d, li, t] = v.split(',').map(Number);
+      cal = { d, l: li, t };
+      $('calInfo').textContent =
+        `Noir ${d} · LED de A allumée ${li} · seuil ${t} · contraste ${Math.abs(li - d)} (vise > 150)`;
+      $('thr').style.left = (t / 1023 * 100) + '%';
+      break;
+    }
+    case 'L': {
+      const n = +v;
+      $('bar').style.width = (n / 1023 * 100) + '%';
+      const lit = cal && (cal.l > cal.d ? n > cal.t : n < cal.t);
+      $('bar').classList.toggle('lit', !!lit);
+      break;
+    }
+    case 'R': {
+      const b = +v;
+      rxBytes.push(b);
+      rxStr += dec.decode(new Uint8Array([b]), { stream: true });
+      rendreRx();
+      break;
+    }
+    case 'E':
+      if (v === 'TRAME') frameErr++;
+      else if (v === 'CONTRASTE_FAIBLE' && !calibrationEnCours) noter('Contraste faible', 'ko');
+      break;
+  }
+}
+
+function rendreRx() {
+  $('rxText').textContent = rxStr;
+  const ref = attendu ? attendu.octets : [];
+  $('rxBits').innerHTML = rxBytes.map((b, i) =>
+    `<span class="${ref.length ? (b === ref[i] ? 'ok' : 'bad') : ''}">${bits8(b)}</span>`).join('');
+}
+
+// ---------------------------------------------------- Canal de contrôle
+(async () => {
+  await ouvrirCanal((t, ok) => {
+    $('etatCanal').textContent = 'Canal de contrôle : ' + t;
+    $('etatCanal').classList.toggle('vert', !!ok);
+  });
+  await sonderMesures();
+
+  surCanal(async p => {
+    if (p.type === 'bitms') {
+      await versCarte('B:' + p.bitMs);
+      noter('Durée d\'un bit alignée sur A : ' + p.bitMs + ' ms');
+    }
+    if (p.type === 'debut') {
+      attendu = p;
+      rxBytes = []; rxStr = ''; dec = new TextDecoder(); frameErr = 0; enCours = true;
+      rendreRx();
+      $('report').textContent = 'A émet ' + p.octets.length + ' octet(s)…';
+      $('report').className = 'muted';
+      await versCarte('B:' + p.bitMs);
+      noter('A commence à émettre');
+      await ouvrirLigne(p);          // c'est cette page qui crée la ligne
+    }
+    if (p.type === 'fin') {
+      // On laisse au dernier octet le temps d'arriver : 3 bits de marge.
+      const marge = attendu ? attendu.bitMs * 4 + 400 : 1500;
+      setTimeout(conclure, marge);
+    }
+  });
+})();
+
+// ------------------------------------------------------- Calibration croisée
+// Demande à A d'allumer ou d'éteindre sa LED, et remonte la raison d'un refus.
+async function piloterLedDeA(on) {
+  const r = await demanderCanal({ type: 'led', on }, ['led_ok', 'led_ko']);
+  if (r.type === 'led_ko') throw new Error('station A : ' + r.raison);
+  return r;
+}
+
+$('cal').onclick = async () => {
+  if (!carte.writer) { noter('Connecte d\'abord l\'Arduino', 'ko'); return; }
+  if (enCours) { noter('Transmission en cours', 'ko'); return; }
+  calibrationEnCours = true;
+  $('calInfo').textContent = 'Calibration croisée en cours, ne bouge rien…';
+  try {
+    await piloterLedDeA(false);          // LED de A éteinte
+    await pause(600);                    // la photorésistance est lente
+    await demanderCarte('K:0', 'K:0');   // mesure du noir
+
+    await piloterLedDeA(true);           // LED de A allumée
+    await pause(600);
+    await demanderCarte('K:1', 'K:1');   // mesure de l'allumé
+
+    await piloterLedDeA(false);
+    await demanderCarte('K:!', 'CAL:');  // calcul du seuil
+
+    const contraste = cal ? Math.abs(cal.l - cal.d) : 0;
+    noter('Calibration terminée · contraste ' + contraste, contraste > 150 ? 'ok' : 'ko');
+    await versCanal({ type: 'calibre', contraste });
+  } catch (e) {
+    $('calInfo').textContent = 'Calibration interrompue : ' + e.message;
+    noter('Calibration interrompue : ' + e.message, 'ko');
+  } finally {
+    calibrationEnCours = false;
+  }
+};
+
+// ------------------------------------------------------------------ Bilan
+async function conclure() {
+  if (!enCours) return;
+  enCours = false;
+  const ref = attendu ? attendu.octets : [];
+  const n = Math.max(ref.length, rxBytes.length);
+  let bitErr = 0;
+  for (let i = 0; i < n; i++) {
+    const a = ref[i], b = rxBytes[i];
+    if (a === undefined || b === undefined) { bitErr += 8; continue; }
+    let x = a ^ b;
+    while (x) { bitErr += x & 1; x >>= 1; }
+  }
+  const parfait = bitErr === 0 && frameErr === 0 && rxBytes.length === ref.length;
+  const pct = ref.length ? (bitErr / (ref.length * 8) * 100).toFixed(1) : '—';
+
+  $('report').textContent = parfait
+    ? `Transmission parfaite (${rxBytes.length} octets).`
+    : `${rxBytes.length}/${ref.length} octets · ${bitErr} bits faux (${pct} %) · ${frameErr} erreur(s) de trame.`;
+  $('report').className = parfait ? 'vert' : 'rouge';
+  rendreRx();
+
+  // Cette page est la seule à écrire dans Supabase : elle seule sait ce qui est
+  // réellement arrivé par la lumière.
+  await cloreLigne(parfait, bitErr);
+  await versCanal({ type: 'resultat', ligne: ligneId, ok: parfait,
+                    bitsFaux: bitErr, recu: rxStr });
+  ligneId = null;
+}
+
+// Ouvre la ligne dès que A annonce son émission : statut EN_COURS.
+async function ouvrirLigne(p) {
+  ligneId = null;
+  if (!sb) return;
+  const ligne = {
+    [COL.envoye]: p.texte,
+    [COL.bitEnv]: p.bits,
+    [COL.statut]: STATUT.encours,
+  };
+  if (mesuresDispo) {
+    ligne[COL.bitMs] = p.bitMs;
+    ligne[COL.contraste] = cal ? Math.abs(cal.l - cal.d) : null;
+  }
+  const { data, error } = await sb.from(COL.table).insert(ligne).select('id').single();
+  if (error || !data) { noter('Supabase : ' + (error ? error.message : 'ligne non créée'), 'ko'); return; }
+  ligneId = data.id;
+  noter('Ligne #' + ligneId + ' ouverte (EN_COURS)');
+}
+
+// Complète la ligne une fois la transmission terminée.
+async function cloreLigne(parfait, bitErr) {
+  if (!sb || ligneId === null) return;
+  const maj = {
+    [COL.bitRec]:  suiteBits(rxBytes),
+    [COL.retrans]: rxStr,
+    [COL.statut]:  parfait ? STATUT.ok : STATUT.erreur,
+  };
+  if (mesuresDispo) maj[COL.bitsFaux] = bitErr;
+  const { error } = await sb.from(COL.table).update(maj).eq('id', ligneId);
+  noter(error ? 'Supabase : ' + error.message
+              : 'Ligne #' + ligneId + ' complétée (' + (parfait ? 'OK' : 'ERREUR') + ')',
+        error ? 'ko' : 'ok');
+}
+
+$('clear').onclick = () => {
+  rxBytes = []; rxStr = ''; attendu = null;
+  rendreRx(); $('report').textContent = 'En attente d\'une transmission.';
+  $('report').className = 'muted';
+};
+</script>
+</body>
+</html>
